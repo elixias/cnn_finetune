@@ -1,13 +1,15 @@
 # -*- coding: utf-8 -*-
 
 from keras.optimizers import SGD
-from keras.layers import Input, merge, ZeroPadding2D
-from keras.layers.core import Dense, Dropout, Activation
-from keras.layers.convolutional import Convolution2D
-from keras.layers.pooling import AveragePooling2D, GlobalAveragePooling2D, MaxPooling2D
-from keras.layers.normalization import BatchNormalization
+from keras.layers import *
+#from keras.layers import Input, merge, ZeroPadding2D
+#from keras.layers.core import Dense, Dropout, Activation
+#from keras.layers.convolutional import Convolution2D
+#from keras.layers.pooling import AveragePooling2D, GlobalAveragePooling2D, MaxPooling2D
+#from keras.layers.normalization import BatchNormalization
 from keras.models import Model
 import keras.backend as K
+from keras.optimizers import Adam
 
 from sklearn.metrics import log_loss
 
@@ -93,26 +95,126 @@ def densenet121_model(img_rows, img_cols, color_type=1, nb_dense_block=4, growth
     else:
       # Use pre-trained weights for Tensorflow backend
       weights_path = 'imagenet_models/densenet121_weights_tf.h5'
-
+    #weights_path = "none";
     model.load_weights(weights_path, by_name=True)
 
     # Truncate and replace softmax layer for transfer learning
     # Cannot use model.layers.pop() since model is not of Sequential() type
     # The method below works since pre-trained weights are stored in layers but not in the model
     x_newfc = GlobalAveragePooling2D(name='pool'+str(final_stage))(x)
-    x_newfc = Dense(num_classes, name='fc6')(x_newfc)
-    x_newfc = Activation('softmax', name='prob')(x_newfc)
+    #x_newfc = Dense(num_classes, name='fc6')(x_newfc)
+    #x_newfc = Activation('softmax', name='prob')(x_newfc)
 
     model = Model(img_input, x_newfc)
 
     # Learning rate is changed to 0.001
-    sgd = SGD(lr=1e-3, decay=1e-6, momentum=0.9, nesterov=True)
-    model.compile(optimizer=sgd, loss='categorical_crossentropy', metrics=['accuracy'])
+    #sgd = SGD(lr=0, decay=0, momentum=0.9, nesterov=True)
+    #model.compile(optimizer=sgd, loss='categorical_crossentropy', metrics=['accuracy'])
 
     return model
 
+def densenet121_nw_model(img_rows, img_cols, color_type=1, nb_dense_block=4, growth_rate=32, nb_filter=64, reduction=0.5, dropout_rate=0.0, weight_decay=1e-4, num_classes=None):
+    '''
+    DenseNet 121 Model for Keras
 
-def conv_block(x, stage, branch, nb_filter, dropout_rate=None, weight_decay=1e-4):
+    Model Schema is based on 
+    https://github.com/flyyufelix/DenseNet-Keras
+
+    ImageNet Pretrained Weights 
+    Theano: https://drive.google.com/open?id=0Byy2AcGyEVxfMlRYb3YzV210VzQ
+    TensorFlow: https://drive.google.com/open?id=0Byy2AcGyEVxfSTA4SHJVOHNuTXc
+
+    # Arguments
+        nb_dense_block: number of dense blocks to add to end
+        growth_rate: number of filters to add per dense block
+        nb_filter: initial number of filters
+        reduction: reduction factor of transition blocks.
+        dropout_rate: dropout rate
+        weight_decay: weight decay factor
+        classes: optional number of classes to classify images
+        weights_path: path to pre-trained weights
+    # Returns
+        A Keras model instance.
+    '''
+    eps = 1.1e-5
+
+    # compute compression factor
+    compression = 1.0 - reduction
+
+    # Handle Dimension Ordering for different backends
+    global concat_axis
+    if K.image_dim_ordering() == 'tf':
+      concat_axis = 3
+      img_input = Input(shape=(img_rows, img_cols, color_type), name='nw_data')
+    else:
+      concat_axis = 1
+      img_input = Input(shape=(color_type, img_rows, img_cols), name='nw_data')
+
+    # From architecture for ImageNet (Table 1 in the paper)
+    nb_filter = 64
+    nb_layers = [6,12,24,16] # For DenseNet-121
+    #nb_filter = 1
+    #nb_layers = [1,1,1,1] # For DenseNet-X
+
+    # Initial convolution
+    x = ZeroPadding2D((3, 3), name='nw_conv1_zeropadding')(img_input)
+    x = Convolution2D(nb_filter, 7, 7, subsample=(2, 2), name='nw_conv1', bias=False)(x)
+    x = BatchNormalization(epsilon=eps, axis=concat_axis, name='nw_conv1_bn')(x)
+    x = Scale(axis=concat_axis, name='nw_conv1_scale')(x)
+    x = Activation('relu', name='nw_relu1')(x)
+    x = ZeroPadding2D((1, 1), name='nw_pool1_zeropadding')(x)
+    x = MaxPooling2D((3, 3), strides=(2, 2), name='nw_pool1')(x)
+
+    # Add dense blocks
+    for block_idx in range(nb_dense_block - 1):
+        stage = block_idx+2
+        x, nb_filter = dense_block(x, stage, nb_layers[block_idx], nb_filter, growth_rate, dropout_rate=dropout_rate, weight_decay=weight_decay, nw="nw")
+
+        # Add transition_block
+        x = transition_block(x, stage, nb_filter, compression=compression, dropout_rate=dropout_rate, weight_decay=weight_decay, nw="nw")
+        nb_filter = int(nb_filter * compression)
+
+    final_stage = stage + 1
+    x, nb_filter = dense_block(x, final_stage, nb_layers[-1], nb_filter, growth_rate, dropout_rate=dropout_rate, weight_decay=weight_decay, nw="nw")
+
+    x = BatchNormalization(epsilon=eps, axis=concat_axis, name='nw_conv'+str(final_stage)+'_blk_bn')(x)
+    x = Scale(axis=concat_axis, name='nw_conv'+str(final_stage)+'_blk_scale')(x)
+    x = Activation('relu', name='nw_relu'+str(final_stage)+'_blk')(x)
+
+    x_fc = GlobalAveragePooling2D(name='nw_pool'+str(final_stage))(x)
+    x_fc = Dense(1000, name='nw_fc6')(x_fc)
+    x_fc = Activation('softmax', name='nw_prob')(x_fc)
+
+    model = Model(img_input, x_fc, name='nw_densenet')
+    
+    if K.image_dim_ordering() == 'th':
+      # Use pre-trained weights for Theano backend
+      weights_path = 'imagenet_models/densenet121_weights_th.h5'
+    else:
+      # Use pre-trained weights for Tensorflow backend
+      weights_path = 'imagenet_models/densenet121_weights_tf.h5'
+    #weights_path = "none";
+    model.load_weights(weights_path, by_name=True)
+
+    # Truncate and replace softmax layer for transfer learning
+    # Cannot use model.layers.pop() since model is not of Sequential() type
+    # The method below works since pre-trained weights are stored in layers but not in the model
+    x_newfc = GlobalAveragePooling2D(name='nw_pool'+str(final_stage))(x)
+    #x_newfc = Dense(num_classes, name='nw_fc6')(x_newfc)
+    #x_newfc = Activation('softmax', name='nw_prob')(x_newfc)
+
+    model = Model(img_input, x_newfc)
+
+    # Learning rate is changed to 0.001
+    #sgd = SGD(lr=1e-3, decay=1e-6, momentum=0.9, nesterov=True)
+    #model.compile(optimizer=sgd, loss='categorical_crossentropy', metrics=['accuracy'])
+
+    #adam = Adam(lr=1e-3, decay=1e-6, amsgrad=True)
+    #model.compile(optimizer=adam, loss='categorical_crossentropy', metrics=['accuracy'])
+
+    return model
+
+def conv_block(x, stage, branch, nb_filter, dropout_rate=None, weight_decay=1e-4, nw=None):
     '''Apply BatchNorm, Relu, bottleneck 1x1 Conv2D, 3x3 Conv2D, and option dropout
         # Arguments
             x: input tensor 
@@ -122,9 +224,13 @@ def conv_block(x, stage, branch, nb_filter, dropout_rate=None, weight_decay=1e-4
             dropout_rate: dropout rate
             weight_decay: weight decay factor
     '''
+    t=True
+    if nw is None:
+        t=False
+    print("Trainable is : "+str(t))
     eps = 1.1e-5
-    conv_name_base = 'conv' + str(stage) + '_' + str(branch)
-    relu_name_base = 'relu' + str(stage) + '_' + str(branch)
+    conv_name_base = xstr(nw)+'conv' + str(stage) + '_' + str(branch)
+    relu_name_base = xstr(nw)+'relu' + str(stage) + '_' + str(branch)
 
     # 1x1 Convolution (Bottleneck layer)
     inter_channel = nb_filter * 4  
@@ -149,7 +255,7 @@ def conv_block(x, stage, branch, nb_filter, dropout_rate=None, weight_decay=1e-4
     return x
 
 
-def transition_block(x, stage, nb_filter, compression=1.0, dropout_rate=None, weight_decay=1E-4):
+def transition_block(x, stage, nb_filter, compression=1.0, dropout_rate=None, weight_decay=1E-4, nw=None):
     ''' Apply BatchNorm, 1x1 Convolution, averagePooling, optional compression, dropout 
         # Arguments
             x: input tensor
@@ -159,11 +265,14 @@ def transition_block(x, stage, nb_filter, compression=1.0, dropout_rate=None, we
             dropout_rate: dropout rate
             weight_decay: weight decay factor
     '''
-
+    t=True
+    if nw is None:
+        t=False
+    print("Trainable is : "+str(t))
     eps = 1.1e-5
-    conv_name_base = 'conv' + str(stage) + '_blk'
-    relu_name_base = 'relu' + str(stage) + '_blk'
-    pool_name_base = 'pool' + str(stage) 
+    conv_name_base = xstr(nw)+'conv' + str(stage) + '_blk'
+    relu_name_base = xstr(nw)+'relu' + str(stage) + '_blk'
+    pool_name_base = xstr(nw)+'pool' + str(stage) 
 
     x = BatchNormalization(epsilon=eps, axis=concat_axis, name=conv_name_base+'_bn')(x)
     x = Scale(axis=concat_axis, name=conv_name_base+'_scale')(x)
@@ -178,7 +287,7 @@ def transition_block(x, stage, nb_filter, compression=1.0, dropout_rate=None, we
     return x
 
 
-def dense_block(x, stage, nb_layers, nb_filter, growth_rate, dropout_rate=None, weight_decay=1e-4, grow_nb_filters=True):
+def dense_block(x, stage, nb_layers, nb_filter, growth_rate, dropout_rate=None, weight_decay=1e-4, grow_nb_filters=True, nw=None):
     ''' Build a dense_block where the output of each conv_block is fed to subsequent ones
         # Arguments
             x: input tensor
@@ -196,13 +305,18 @@ def dense_block(x, stage, nb_layers, nb_filter, growth_rate, dropout_rate=None, 
 
     for i in range(nb_layers):
         branch = i+1
-        x = conv_block(concat_feat, stage, branch, growth_rate, dropout_rate, weight_decay)
-        concat_feat = merge([concat_feat, x], mode='concat', concat_axis=concat_axis, name='concat_'+str(stage)+'_'+str(branch))
+        x = conv_block(concat_feat, stage, branch, growth_rate, dropout_rate, weight_decay, nw=nw)
+        concat_feat = merge([concat_feat, x], mode='concat', concat_axis=concat_axis, name=xstr(nw)+'concat_'+str(stage)+'_'+str(branch))
 
         if grow_nb_filters:
             nb_filter += growth_rate
 
     return concat_feat, nb_filter
+
+def xstr(s):
+    if s is None:
+        return ''
+    return str(s)
 
 if __name__ == '__main__':
 
@@ -212,25 +326,46 @@ if __name__ == '__main__':
     channel = 3
     num_classes = 10 
     batch_size = 16 
-    nb_epoch = 10
+    nb_epoch = 150
 
     # Load Cifar10 data. Please implement your own load_data() module for your own dataset
     X_train, Y_train, X_valid, Y_valid = load_cifar10_data(img_rows, img_cols)
 
     # Load our model
+    #x_newfc = Activation('softmax', name='prob')(x_newfc)
+    print("Begin model 1")
     model = densenet121_model(img_rows=img_rows, img_cols=img_cols, color_type=channel, num_classes=num_classes)
+    print("Begin model 2")
+    model2 = densenet121_nw_model(img_rows=img_rows, img_cols=img_cols, color_type=channel, num_classes=num_classes)
+
+    mergedOut = Add()([model.output,model2.output])
+    mergedOut = Dense(num_classes, name='cmb_fc6')(mergedOut)
+    mergedOut = Activation('softmax', name='cmb_prob')(mergedOut)
+    newModel = Model([model.input,model2.input], mergedOut)
+    
+    #mergedOut = Add()([model.output,model2.output])
+    #mergedOut = Flatten()(mergedOut)    
+    #mergedOut = Dense(num_classes, name='cmb_fc6')(model2.output)
+    #mergedOut = Activation('softmax', name='cmb_prob')(mergedOut)
+    #newModel = Model(model2.input, mergedOut)
+    
+    adam = Adam(lr=1e-3, decay=1e-6, amsgrad=True)
+    newModel.compile(optimizer=adam, loss='categorical_crossentropy', metrics=['accuracy'])
 
     # Start Fine-tuning
-    model.fit(X_train, Y_train,
+    newModel.fit([X_train,X_train], Y_train,
               batch_size=batch_size,
               nb_epoch=nb_epoch,
               shuffle=True,
               verbose=1,
-              validation_data=(X_valid, Y_valid),
+              validation_data=([X_valid,X_valid],Y_valid)
               )
 
     # Make predictions
-    predictions_valid = model.predict(X_valid, batch_size=batch_size, verbose=1)
+    predictions_valid = newModel.predict([X_valid,X_valid], batch_size=batch_size, verbose=1)
 
     # Cross-entropy loss score
     score = log_loss(Y_valid, predictions_valid)
+    print(score)
+    
+    newModel.evaluate()
